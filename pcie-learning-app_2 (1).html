@@ -1,0 +1,1809 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PCIe Learning Application</title>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .bit-field {
+            transition: all 0.2s;
+        }
+        .bit-field:hover {
+            transform: scale(1.05);
+            z-index: 10;
+        }
+        .hex-display {
+            font-family: 'Courier New', monospace;
+            letter-spacing: 2px;
+        }
+        .tooltip {
+            position: relative;
+        }
+        .tooltip:hover .tooltip-text {
+            visibility: visible;
+            opacity: 1;
+        }
+        .tooltip-text {
+            visibility: hidden;
+            opacity: 0;
+            transition: opacity 0.3s;
+            position: absolute;
+            z-index: 100;
+            bottom: 125%;
+            left: 50%;
+            transform: translateX(-50%);
+            background-color: #1f2937;
+            color: white;
+            padding: 8px 12px;
+            border-radius: 6px;
+            white-space: nowrap;
+            font-size: 12px;
+        }
+        .credit-bar {
+            transition: width 0.3s ease;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect } = React;
+
+        // TLP Type Definitions and Rules Engine
+        const TLP_TYPES = {
+            MRd: { code: '00000', name: 'Memory Read Request', hasPayload: false, posted: false, requiresCompletion: true },
+            MRdLk: { code: '00001', name: 'Memory Read Lock Request', hasPayload: false, posted: false, requiresCompletion: true },
+            MWr: { code: '01000', name: 'Memory Write Request', hasPayload: true, posted: true, requiresCompletion: false },
+            IORd: { code: '00010', name: 'I/O Read Request', hasPayload: false, posted: false, requiresCompletion: true },
+            IOWr: { code: '01010', name: 'I/O Write Request', hasPayload: true, posted: false, requiresCompletion: true },
+            CfgRd0: { code: '00100', name: 'Configuration Read Type 0', hasPayload: false, posted: false, requiresCompletion: true },
+            CfgWr0: { code: '01100', name: 'Configuration Write Type 0', hasPayload: true, posted: false, requiresCompletion: true },
+            CfgRd1: { code: '00101', name: 'Configuration Read Type 1', hasPayload: false, posted: false, requiresCompletion: true },
+            CfgWr1: { code: '01101', name: 'Configuration Write Type 1', hasPayload: true, posted: false, requiresCompletion: true },
+            Cpl: { code: '01010', name: 'Completion without Data', hasPayload: false, posted: false, requiresCompletion: false, isCompletion: true },
+            CplD: { code: '01010', name: 'Completion with Data', hasPayload: true, posted: false, requiresCompletion: false, isCompletion: true },
+        };
+
+        // DLLP Type Definitions
+        const DLLP_TYPES = {
+            Ack: { 
+                code: '0000', 
+                name: 'Ack', 
+                description: 'Acknowledge - Confirms successful TLP reception',
+                hasSeqNum: true,
+                category: 'Flow Control'
+            },
+            Nak: { 
+                code: '0001', 
+                name: 'Nak', 
+                description: 'Negative Acknowledge - Requests TLP retransmission',
+                hasSeqNum: true,
+                category: 'Flow Control'
+            },
+            InitFC1_P: { 
+                code: '0100', 
+                name: 'InitFC1-P', 
+                description: 'Initialize Flow Control - Posted',
+                hasSeqNum: false,
+                category: 'Flow Control',
+                creditType: 'posted'
+            },
+            InitFC1_NP: { 
+                code: '0101', 
+                name: 'InitFC1-NP', 
+                description: 'Initialize Flow Control - Non-Posted',
+                hasSeqNum: false,
+                category: 'Flow Control',
+                creditType: 'nonPosted'
+            },
+            InitFC1_Cpl: { 
+                code: '0110', 
+                name: 'InitFC1-Cpl', 
+                description: 'Initialize Flow Control - Completion',
+                hasSeqNum: false,
+                category: 'Flow Control',
+                creditType: 'completion'
+            },
+            UpdateFC_P: { 
+                code: '1000', 
+                name: 'UpdateFC-P', 
+                description: 'Update Flow Control - Posted',
+                hasSeqNum: false,
+                category: 'Flow Control',
+                creditType: 'posted'
+            },
+            UpdateFC_NP: { 
+                code: '1001', 
+                name: 'UpdateFC-NP', 
+                description: 'Update Flow Control - Non-Posted',
+                hasSeqNum: false,
+                category: 'Flow Control',
+                creditType: 'nonPosted'
+            },
+            UpdateFC_Cpl: { 
+                code: '1010', 
+                name: 'UpdateFC-Cpl', 
+                description: 'Update Flow Control - Completion',
+                hasSeqNum: false,
+                category: 'Flow Control',
+                creditType: 'completion'
+            },
+            PM_Enter_L1: { 
+                code: '0010', 
+                name: 'PM_Enter_L1', 
+                description: 'Power Management - Enter L1 State',
+                hasSeqNum: false,
+                category: 'Power Management'
+            },
+            PM_Enter_L23: { 
+                code: '0011', 
+                name: 'PM_Enter_L23', 
+                description: 'Power Management - Enter L23 State',
+                hasSeqNum: false,
+                category: 'Power Management'
+            },
+            PM_Request_Ack: { 
+                code: '0100', 
+                name: 'PM_Request_Ack', 
+                description: 'Power Management - Acknowledge PM Request',
+                hasSeqNum: false,
+                category: 'Power Management'
+            }
+        };
+
+        // PCIe Capability Structure
+        const PCIE_CAPABILITIES = {
+            deviceCapabilities: {
+                maxPayloadSize: [128, 256, 512, 1024, 2048, 4096],
+                phantomFunctions: [0, 1, 2, 3],
+                extendedTag: [5, 8],
+                l0sLatency: ['<64ns', '64ns-128ns', '128ns-256ns', '256ns-512ns', '512ns-1us', '1us-2us', '2us-4us', '>4us'],
+                l1Latency: ['<1us', '1us-2us', '2us-4us', '4us-8us', '8us-16us', '16us-32us', '32us-64us', '>64us']
+            },
+            linkCapabilities: {
+                maxLinkSpeed: ['2.5GT/s', '5.0GT/s', '8.0GT/s', '16.0GT/s', '32.0GT/s'],
+                maxLinkWidth: ['x1', 'x2', 'x4', 'x8', 'x12', 'x16', 'x32'],
+                aspm: ['L0s', 'L1', 'L0s and L1'],
+                portNumber: 0
+            },
+            deviceControl: {
+                maxPayloadSize: 128,
+                maxReadRequestSize: 512,
+                relaxedOrdering: false,
+                extendedTag: false,
+                phantomFunctions: false
+            }
+        };
+
+        const FMT_TYPES = {
+            '3DW_NoData': { code: '000', bits: '3DW', hasData: false, description: '3 DW Header, No Data' },
+            '4DW_NoData': { code: '001', bits: '4DW', hasData: false, description: '4 DW Header, No Data' },
+            '3DW_Data': { code: '010', bits: '3DW+Data', hasData: true, description: '3 DW Header, With Data' },
+            '4DW_Data': { code: '011', bits: '4DW+Data', hasData: true, description: '4 DW Header, With Data' },
+        };
+
+        // TLP Validation Engine
+        class TLPValidator {
+            static validate(tlpConfig) {
+                const errors = [];
+                const warnings = [];
+
+                // Address alignment check
+                const addr = parseInt(tlpConfig.address, 16);
+                if (addr % 4 !== 0) {
+                    errors.push('Address must be DWORD-aligned (divisible by 4)');
+                }
+
+                // Length validation
+                const length = parseInt(tlpConfig.length);
+                const tlpType = TLP_TYPES[tlpConfig.type];
+                
+                // For non-payload TLPs (reads), length indicates requested data, not header length
+                if (!tlpType.hasPayload) {
+                    if (length < 1 || length > 1024) {
+                        errors.push('Read request length must be between 1 and 1024 DWords');
+                    }
+                } else {
+                    // For payload TLPs (writes), length is actual payload
+                    if (length < 1 || length > 1024) {
+                        errors.push('Write payload length must be between 1 and 1024 DWords');
+                    }
+                }
+
+                // Format vs Type consistency
+                if (tlpType.hasPayload && tlpConfig.format.includes('NoData')) {
+                    errors.push(`${tlpType.name} requires data payload - select format with Data`);
+                }
+                if (!tlpType.hasPayload && tlpConfig.format.includes('Data')) {
+                    errors.push(`${tlpType.name} cannot have data payload - select format without Data`);
+                }
+
+                // 3DW vs 4DW for address range
+                if (addr > 0xFFFFFFFF && tlpConfig.format.includes('3DW')) {
+                    errors.push('Address > 4GB requires 4DW format');
+                }
+                if (addr <= 0xFFFFFFFF && tlpConfig.format.includes('4DW')) {
+                    warnings.push('Address < 4GB: Consider using 3DW format for efficiency');
+                }
+
+                // Byte Enable checks
+                if (length === 1 && tlpConfig.lastBE !== '0000') {
+                    warnings.push('Single DWord transfer: Last BE should be 0000');
+                }
+
+                // Requester ID format
+                const reqIdPattern = /^[0-9a-fA-F]{4}$/;
+                if (!reqIdPattern.test(tlpConfig.requesterId)) {
+                    errors.push('Requester ID must be 4 hex digits (e.g., 0100)');
+                }
+
+                return { errors, warnings, isValid: errors.length === 0 };
+            }
+        }
+
+        // TLP Encoder
+        class TLPEncoder {
+            static encode(tlpConfig) {
+                const tlpType = TLP_TYPES[tlpConfig.type];
+                const fmtInfo = FMT_TYPES[tlpConfig.format];
+                
+                // Determine Fmt field based on format selection
+                let fmtBits = fmtInfo.code;
+                
+                // Build DW0: [Fmt(3)][Type(5)][R(1)][TC(3)][R(4)][Attr(2)][R(2)][Length(10)]
+                const fmt = fmtBits;
+                const type = tlpType.code;
+                const tc = tlpConfig.tc.padStart(3, '0');
+                const attr = '00'; // Simplified for V1
+                
+                // For requests without payload (MRd, IORd, CfgRd), length should be 0 in header
+                // But we store the requested read length for analysis
+                const actualLength = tlpType.hasPayload ? parseInt(tlpConfig.length) : 0;
+                const length = actualLength.toString(2).padStart(10, '0');
+                
+                const dw0Bits = fmt + type + '0' + tc + '0000' + attr + '00' + length;
+                const dw0Hex = parseInt(dw0Bits, 2).toString(16).padStart(8, '0').toUpperCase();
+
+                // Build DW1: [Requester ID(16)][Tag(8)][Last BE(4)][First BE(4)]
+                const reqId = tlpConfig.requesterId;
+                const tag = parseInt(tlpConfig.tag, 16).toString(16).padStart(2, '0').toUpperCase();
+                const lastBE = parseInt(tlpConfig.lastBE, 2).toString(16).toUpperCase();
+                const firstBE = parseInt(tlpConfig.firstBE, 2).toString(16).toUpperCase();
+                
+                const dw1Hex = reqId + tag + lastBE + firstBE;
+
+                // Build DW2/3: Address
+                const addr = parseInt(tlpConfig.address, 16);
+                let dw2Hex, dw3Hex;
+                
+                if (tlpConfig.format.includes('3DW')) {
+                    // 3DW: Address[31:2] + Reserved[1:0]
+                    dw2Hex = ((addr >> 2) << 2).toString(16).padStart(8, '0').toUpperCase();
+                    dw3Hex = null;
+                } else {
+                    // 4DW: Upper 32 bits + Lower 32 bits
+                    dw2Hex = ((addr >> 32) & 0xFFFFFFFF).toString(16).padStart(8, '0').toUpperCase();
+                    dw3Hex = ((addr >> 2) << 2).toString(16).padStart(8, '0').toUpperCase();
+                }
+
+                return {
+                    dw0: dw0Hex,
+                    dw1: dw1Hex,
+                    dw2: dw2Hex,
+                    dw3: dw3Hex,
+                    fields: {
+                        fmt: { value: fmt, hex: parseInt(fmt, 2).toString(16).toUpperCase() },
+                        type: { value: type, hex: parseInt(type, 2).toString(16).toUpperCase() },
+                        tc: { value: tc, hex: parseInt(tc, 2).toString(16).toUpperCase() },
+                        length: { value: length, hex: parseInt(length, 2).toString(16).padStart(3, '0').toUpperCase() },
+                        requesterId: reqId,
+                        tag: tag,
+                        firstBE: firstBE,
+                        lastBE: lastBE,
+                        address: addr.toString(16).toUpperCase()
+                    }
+                };
+            }
+
+            static analyze(tlpConfig, encoded) {
+                const tlpType = TLP_TYPES[tlpConfig.type];
+                const analysis = [];
+
+                analysis.push(`✓ TLP Type: ${tlpType.name}`);
+                analysis.push(`✓ Format: ${tlpConfig.format}`);
+                analysis.push(`✓ Posted: ${tlpType.posted ? 'Yes' : 'No'}`);
+                analysis.push(`✓ Requires Completion: ${tlpType.requiresCompletion ? 'Yes' : 'No'}`);
+                
+                if (tlpType.hasPayload) {
+                    // For writes, length is actual payload
+                    analysis.push(`✓ Payload Length: ${tlpConfig.length} DWords (${parseInt(tlpConfig.length) * 4} bytes)`);
+                    analysis.push(`✓ Header Length Field: ${tlpConfig.length} DW (actual payload size)`);
+                } else {
+                    // For reads, length in header is 0, but tlpConfig.length indicates requested data
+                    analysis.push(`✓ Requested Data: ${tlpConfig.length} DWords (${parseInt(tlpConfig.length) * 4} bytes)`);
+                    analysis.push(`✓ Header Length Field: 0 DW (no payload in request)`);
+                    analysis.push(`✓ Expected Completion Size: ${tlpConfig.length} DW`);
+                }
+                
+                const addr = parseInt(tlpConfig.address, 16);
+                analysis.push(`✓ Address: 0x${addr.toString(16).toUpperCase()} (${addr <= 0xFFFFFFFF ? 'Below 4GB' : 'Above 4GB'})`);
+                
+                if (tlpConfig.format.includes('3DW') && addr <= 0xFFFFFFFF) {
+                    analysis.push('✓ Optimal: 3DW format for 32-bit address space');
+                }
+
+                return analysis;
+            }
+        }
+
+        // Sequence Number Manager for DLLP Tracking
+        class SequenceNumberManager {
+            constructor() {
+                this.txSeqNum = 0;  // Transmit sequence number
+                this.rxSeqNum = 0;  // Receive sequence number
+                this.ackSeqNum = 0; // Last acknowledged sequence number
+                this.maxSeqNum = 4095; // 12-bit sequence number (0-4095)
+                this.replayBuffer = [];
+                this.maxReplayBuffer = 8;
+            }
+
+            getNextTxSeqNum() {
+                const current = this.txSeqNum;
+                this.txSeqNum = (this.txSeqNum + 1) % (this.maxSeqNum + 1);
+                return current;
+            }
+
+            addToReplayBuffer(tlp) {
+                this.replayBuffer.push({
+                    seqNum: tlp.seqNum,
+                    tlp: tlp,
+                    timestamp: Date.now()
+                });
+                
+                // Keep buffer size limited
+                if (this.replayBuffer.length > this.maxReplayBuffer) {
+                    this.replayBuffer.shift();
+                }
+            }
+
+            acknowledgeSequence(seqNum) {
+                this.ackSeqNum = seqNum;
+                // Remove acknowledged TLPs from replay buffer
+                this.replayBuffer = this.replayBuffer.filter(item => {
+                    const distance = (seqNum - item.seqNum + this.maxSeqNum + 1) % (this.maxSeqNum + 1);
+                    return distance > this.maxReplayBuffer;
+                });
+            }
+
+            negativeAcknowledge(seqNum) {
+                // Return TLPs that need to be retransmitted
+                return this.replayBuffer.filter(item => {
+                    const distance = (this.txSeqNum - item.seqNum + this.maxSeqNum + 1) % (this.maxSeqNum + 1);
+                    return distance <= this.maxReplayBuffer && item.seqNum >= seqNum;
+                });
+            }
+
+            getStats() {
+                return {
+                    txSeqNum: this.txSeqNum,
+                    rxSeqNum: this.rxSeqNum,
+                    ackSeqNum: this.ackSeqNum,
+                    replayBufferSize: this.replayBuffer.length
+                };
+            }
+        }
+
+        // Credit Manager for Flow Control Simulation
+        class CreditManager {
+            constructor() {
+                this.credits = {
+                    posted: { header: 8, data: 32 },
+                    nonPosted: { header: 8, data: 32 },
+                    completion: { header: 8, data: 32 }
+                };
+                this.maxCredits = JSON.parse(JSON.stringify(this.credits));
+            }
+
+            consumeCredits(tlpType, length) {
+                const creditType = tlpType.posted ? 'posted' : 
+                                 tlpType.isCompletion ? 'completion' : 'nonPosted';
+                
+                if (this.credits[creditType].header < 1) {
+                    return { success: false, reason: 'Insufficient header credits' };
+                }
+                
+                const dataCreditsNeeded = tlpType.hasPayload ? length : 0;
+                if (this.credits[creditType].data < dataCreditsNeeded) {
+                    return { success: false, reason: 'Insufficient data credits' };
+                }
+
+                this.credits[creditType].header -= 1;
+                this.credits[creditType].data -= dataCreditsNeeded;
+                
+                return { success: true, creditType, consumed: { header: 1, data: dataCreditsNeeded } };
+            }
+
+            returnCredits(creditType, amount) {
+                this.credits[creditType].header = Math.min(
+                    this.credits[creditType].header + amount.header,
+                    this.maxCredits[creditType].header
+                );
+                this.credits[creditType].data = Math.min(
+                    this.credits[creditType].data + amount.data,
+                    this.maxCredits[creditType].data
+                );
+            }
+
+            getCredits() {
+                return JSON.parse(JSON.stringify(this.credits));
+            }
+        }
+
+        // Main Application Component
+        function PCIeApp() {
+            const [activeSection, setActiveSection] = useState('guide');
+            const [tlpConfig, setTlpConfig] = useState({
+                type: 'MRd',
+                format: '3DW_NoData',
+                address: '80001000',
+                length: '8',
+                tc: '0',
+                requesterId: '0100',
+                tag: '3A',
+                firstBE: '1111',
+                lastBE: '1111'
+            });
+            const [encodedTLP, setEncodedTLP] = useState(null);
+            const [validation, setValidation] = useState(null);
+            const [creditManager] = useState(new CreditManager());
+            const [seqNumManager] = useState(new SequenceNumberManager());
+            const [credits, setCredits] = useState(creditManager.getCredits());
+            const [seqStats, setSeqStats] = useState(seqNumManager.getStats());
+            const [flowHistory, setFlowHistory] = useState([]);
+            const [pcieConfig, setPcieConfig] = useState({
+                maxPayloadSize: 256,
+                maxReadRequestSize: 512,
+                linkSpeed: '5.0GT/s',
+                linkWidth: 'x4'
+            });
+
+            const handleInputChange = (field, value) => {
+                const newConfig = { ...tlpConfig, [field]: value };
+                
+                // Auto-adjust format based on type
+                const tlpType = TLP_TYPES[value] || TLP_TYPES[tlpConfig.type];
+                if (field === 'type') {
+                    if (tlpType.hasPayload) {
+                        newConfig.format = newConfig.format.includes('3DW') ? '3DW_Data' : '4DW_Data';
+                    } else {
+                        newConfig.format = newConfig.format.includes('3DW') ? '3DW_NoData' : '4DW_NoData';
+                    }
+                }
+                
+                setTlpConfig(newConfig);
+                setEncodedTLP(null);
+                setValidation(null);
+            };
+
+            const generateTLP = () => {
+                const validationResult = TLPValidator.validate(tlpConfig);
+                setValidation(validationResult);
+
+                if (validationResult.isValid) {
+                    const encoded = TLPEncoder.encode(tlpConfig);
+                    const analysis = TLPEncoder.analyze(tlpConfig, encoded);
+                    setEncodedTLP({ ...encoded, analysis });
+                }
+            };
+
+            const sendTLP = () => {
+                if (!encodedTLP) return;
+
+                const tlpType = TLP_TYPES[tlpConfig.type];
+                const result = creditManager.consumeCredits(tlpType, parseInt(tlpConfig.length));
+                
+                if (result.success) {
+                    const seqNum = seqNumManager.getNextTxSeqNum();
+                    const tlpWithSeq = { ...encodedTLP, seqNum, tlpType, length: parseInt(tlpConfig.length) };
+                    
+                    // Add to replay buffer
+                    seqNumManager.addToReplayBuffer(tlpWithSeq);
+                    
+                    const newHistory = [...flowHistory, {
+                        timestamp: new Date().toLocaleTimeString(),
+                        direction: '→',
+                        type: 'TLP',
+                        tlp: tlpType.name,
+                        seqNum: seqNum,
+                        length: tlpConfig.length,
+                        credits: result.consumed,
+                        creditType: result.creditType
+                    }];
+                    setFlowHistory(newHistory);
+                    setCredits(creditManager.getCredits());
+                    setSeqStats(seqNumManager.getStats());
+
+                    // Simulate Ack DLLP after small delay
+                    setTimeout(() => {
+                        seqNumManager.acknowledgeSequence(seqNum);
+                        setFlowHistory(prev => [...prev, {
+                            timestamp: new Date().toLocaleTimeString(),
+                            direction: '←',
+                            type: 'DLLP',
+                            tlp: 'Ack',
+                            seqNum: seqNum,
+                            length: 0,
+                            credits: { header: 0, data: 0 },
+                            creditType: 'ack'
+                        }]);
+                        setSeqStats(seqNumManager.getStats());
+                    }, 800);
+
+                    // Auto-return credits with UpdateFC DLLP
+                    setTimeout(() => {
+                        creditManager.returnCredits(result.creditType, result.consumed);
+                        setCredits(creditManager.getCredits());
+                        
+                        const dllpName = result.creditType === 'posted' ? 'UpdateFC-P' :
+                                       result.creditType === 'nonPosted' ? 'UpdateFC-NP' : 'UpdateFC-Cpl';
+                        
+                        setFlowHistory(prev => [...prev, {
+                            timestamp: new Date().toLocaleTimeString(),
+                            direction: '←',
+                            type: 'DLLP',
+                            tlp: dllpName,
+                            seqNum: null,
+                            length: 0,
+                            credits: result.consumed,
+                            creditType: result.creditType
+                        }]);
+                    }, 1500);
+
+                    // If requires completion, send completion TLP
+                    if (tlpType.requiresCompletion) {
+                        setTimeout(() => {
+                            const cplSeqNum = seqNumManager.getNextTxSeqNum();
+                            setFlowHistory(prev => [...prev, {
+                                timestamp: new Date().toLocaleTimeString(),
+                                direction: '←',
+                                type: 'TLP',
+                                tlp: tlpType.hasPayload ? 'Completion with Data' : 'Completion',
+                                seqNum: cplSeqNum,
+                                length: tlpType.hasPayload ? tlpConfig.length : 0,
+                                credits: { header: 1, data: parseInt(tlpConfig.length) },
+                                creditType: 'completion'
+                            }]);
+                            setSeqStats(seqNumManager.getStats());
+                        }, 2000);
+                    }
+                } else {
+                    alert(result.reason);
+                }
+            };
+
+            return (
+                <div className="min-h-screen bg-gray-50">
+                    {/* Header */}
+                    <header className="bg-gradient-to-r from-blue-600 to-blue-800 text-white shadow-lg">
+                        <div className="container mx-auto px-6 py-4">
+                            <h1 className="text-3xl font-bold">PCIe Learning Application</h1>
+                            <p className="text-blue-100 mt-1">Interactive Protocol Explorer & TLP Builder</p>
+                        </div>
+                    </header>
+
+                    <div className="flex h-[calc(100vh-88px)]">
+                        {/* Sidebar */}
+                        <aside className="w-64 bg-white shadow-lg overflow-y-auto">
+                            <nav className="p-4">
+                                <div className="mb-6">
+                                    <h3 className="text-xs font-semibold text-gray-500 uppercase mb-2">Getting Started</h3>
+                                    <button 
+                                        onClick={() => setActiveSection('guide')}
+                                        className={`w-full text-left px-3 py-2 rounded-lg mb-1 ${activeSection === 'guide' ? 'bg-blue-100 text-blue-700 font-medium' : 'text-gray-700 hover:bg-gray-100'}`}
+                                    >
+                                        📘 Interactive Guide
+                                    </button>
+                                </div>
+
+                                <div className="mb-6">
+                                    <h3 className="text-xs font-semibold text-gray-500 uppercase mb-2">Transaction Layer</h3>
+                                    <button 
+                                        onClick={() => setActiveSection('tlp-builder')}
+                                        className={`w-full text-left px-3 py-2 rounded-lg mb-1 ${activeSection === 'tlp-builder' ? 'bg-blue-100 text-blue-700 font-medium' : 'text-gray-700 hover:bg-gray-100'}`}
+                                    >
+                                        🔧 TLP Builder
+                                    </button>
+                                </div>
+                                
+                                <div className="mb-6">
+                                    <h3 className="text-xs font-semibold text-gray-500 uppercase mb-2">Data Link Layer</h3>
+                                    <button 
+                                        onClick={() => setActiveSection('dllp-explorer')}
+                                        className={`w-full text-left px-3 py-2 rounded-lg mb-1 ${activeSection === 'dllp-explorer' ? 'bg-blue-100 text-blue-700 font-medium' : 'text-gray-700 hover:bg-gray-100'}`}
+                                    >
+                                        📡 DLLP Explorer
+                                    </button>
+                                    <button 
+                                        onClick={() => setActiveSection('sequence-tracker')}
+                                        className={`w-full text-left px-3 py-2 rounded-lg mb-1 ${activeSection === 'sequence-tracker' ? 'bg-blue-100 text-blue-700 font-medium' : 'text-gray-700 hover:bg-gray-100'}`}
+                                    >
+                                        🔢 Sequence Tracker
+                                    </button>
+                                    <button 
+                                        onClick={() => setActiveSection('flow-control')}
+                                        className={`w-full text-left px-3 py-2 rounded-lg ${activeSection === 'flow-control' ? 'bg-blue-100 text-blue-700 font-medium' : 'text-gray-700 hover:bg-gray-100'}`}
+                                    >
+                                        🎮 Flow Control Simulator
+                                    </button>
+                                </div>
+
+                                <div className="mb-6">
+                                    <h3 className="text-xs font-semibold text-gray-500 uppercase mb-2">Configuration</h3>
+                                    <button 
+                                        onClick={() => setActiveSection('capabilities')}
+                                        className={`w-full text-left px-3 py-2 rounded-lg ${activeSection === 'capabilities' ? 'bg-blue-100 text-blue-700 font-medium' : 'text-gray-700 hover:bg-gray-100'}`}
+                                    >
+                                        ⚙️ PCIe Capabilities
+                                    </button>
+                                </div>
+
+                                <div>
+                                    <h3 className="text-xs font-semibold text-gray-500 uppercase mb-2">Physical Layer</h3>
+                                    <button className="w-full text-left px-3 py-2 rounded-lg text-gray-400 cursor-not-allowed">
+                                        LTSSM (Coming Soon)
+                                    </button>
+                                </div>
+                            </nav>
+                        </aside>
+
+                        {/* Main Content */}
+                        <main className="flex-1 overflow-y-auto p-6">
+                            {activeSection === 'guide' && (
+                                <GuideSection />
+                            )}
+
+                            {activeSection === 'tlp-builder' && (
+                                <TLPBuilder 
+                                    tlpConfig={tlpConfig}
+                                    onInputChange={handleInputChange}
+                                    onGenerate={generateTLP}
+                                    encodedTLP={encodedTLP}
+                                    validation={validation}
+                                />
+                            )}
+                            
+                            {activeSection === 'dllp-explorer' && (
+                                <DLLPExplorer />
+                            )}
+
+                            {activeSection === 'sequence-tracker' && (
+                                <SequenceTracker 
+                                    seqStats={seqStats}
+                                    flowHistory={flowHistory}
+                                />
+                            )}
+
+                            {activeSection === 'flow-control' && (
+                                <FlowControlSimulator 
+                                    credits={credits}
+                                    flowHistory={flowHistory}
+                                    onSendTLP={sendTLP}
+                                    hasEncodedTLP={!!encodedTLP}
+                                />
+                            )}
+
+                            {activeSection === 'capabilities' && (
+                                <PCIeCapabilities 
+                                    config={pcieConfig}
+                                    onConfigChange={setPcieConfig}
+                                />
+                            )}
+                        </main>
+                    </div>
+                </div>
+            );
+        }
+
+        // TLP Builder Component
+        function TLPBuilder({ tlpConfig, onInputChange, onGenerate, encodedTLP, validation }) {
+            return (
+                <div className="space-y-6">
+                    <div>
+                        <h2 className="text-2xl font-bold text-gray-800 mb-2">TLP Header Builder</h2>
+                        <p className="text-gray-600">Configure and generate PCIe Transaction Layer Packets with real-time validation and analysis.</p>
+                    </div>
+
+                    {/* Input Form */}
+                    <div className="bg-white rounded-lg shadow-md p-6">
+                        <h3 className="text-lg font-semibold mb-4">TLP Configuration</h3>
+                        
+                        <div className="grid grid-cols-2 gap-4">
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-1">TLP Type</label>
+                                <select 
+                                    className="w-full border border-gray-300 rounded-md px-3 py-2"
+                                    value={tlpConfig.type}
+                                    onChange={(e) => onInputChange('type', e.target.value)}
+                                >
+                                    {Object.entries(TLP_TYPES).map(([key, type]) => (
+                                        <option key={key} value={key}>{type.name}</option>
+                                    ))}
+                                </select>
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-1">Format</label>
+                                <select 
+                                    className="w-full border border-gray-300 rounded-md px-3 py-2"
+                                    value={tlpConfig.format}
+                                    onChange={(e) => onInputChange('format', e.target.value)}
+                                >
+                                    {Object.entries(FMT_TYPES).map(([key, fmt]) => (
+                                        <option key={key} value={key}>{fmt.description}</option>
+                                    ))}
+                                </select>
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-1">Address (Hex)</label>
+                                <input 
+                                    type="text"
+                                    className="w-full border border-gray-300 rounded-md px-3 py-2 font-mono"
+                                    value={tlpConfig.address}
+                                    onChange={(e) => onInputChange('address', e.target.value)}
+                                    placeholder="80001000"
+                                />
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-1">
+                                    Length (DWords)
+                                    {!TLP_TYPES[tlpConfig.type].hasPayload && (
+                                        <span className="text-xs text-blue-600 ml-2">(Requested data size for read)</span>
+                                    )}
+                                    {TLP_TYPES[tlpConfig.type].hasPayload && (
+                                        <span className="text-xs text-green-600 ml-2">(Actual payload size)</span>
+                                    )}
+                                </label>
+                                <input 
+                                    type="number"
+                                    className="w-full border border-gray-300 rounded-md px-3 py-2"
+                                    value={tlpConfig.length}
+                                    onChange={(e) => onInputChange('length', e.target.value)}
+                                    min="1"
+                                    max="1024"
+                                />
+                                {!TLP_TYPES[tlpConfig.type].hasPayload && (
+                                    <p className="text-xs text-gray-500 mt-1">
+                                        For read requests, this specifies how much data to request (header length field will be 0)
+                                    </p>
+                                )}
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-1">Requester ID (Hex)</label>
+                                <input 
+                                    type="text"
+                                    className="w-full border border-gray-300 rounded-md px-3 py-2 font-mono"
+                                    value={tlpConfig.requesterId}
+                                    onChange={(e) => onInputChange('requesterId', e.target.value)}
+                                    placeholder="0100"
+                                    maxLength="4"
+                                />
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-1">Tag (Hex)</label>
+                                <input 
+                                    type="text"
+                                    className="w-full border border-gray-300 rounded-md px-3 py-2 font-mono"
+                                    value={tlpConfig.tag}
+                                    onChange={(e) => onInputChange('tag', e.target.value)}
+                                    placeholder="3A"
+                                    maxLength="2"
+                                />
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-1">First BE</label>
+                                <input 
+                                    type="text"
+                                    className="w-full border border-gray-300 rounded-md px-3 py-2 font-mono"
+                                    value={tlpConfig.firstBE}
+                                    onChange={(e) => onInputChange('firstBE', e.target.value)}
+                                    placeholder="1111"
+                                    maxLength="4"
+                                />
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-1">Last BE</label>
+                                <input 
+                                    type="text"
+                                    className="w-full border border-gray-300 rounded-md px-3 py-2 font-mono"
+                                    value={tlpConfig.lastBE}
+                                    onChange={(e) => onInputChange('lastBE', e.target.value)}
+                                    placeholder="1111"
+                                    maxLength="4"
+                                />
+                            </div>
+                        </div>
+
+                        <button 
+                            onClick={onGenerate}
+                            className="mt-6 w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 rounded-lg transition"
+                        >
+                            Generate TLP
+                        </button>
+                    </div>
+
+                    {/* Validation Messages */}
+                    {validation && (
+                        <div className="space-y-2">
+                            {validation.errors.map((error, idx) => (
+                                <div key={idx} className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg">
+                                    <span className="font-medium">Error:</span> {error}
+                                </div>
+                            ))}
+                            {validation.warnings.map((warning, idx) => (
+                                <div key={idx} className="bg-yellow-50 border border-yellow-200 text-yellow-700 px-4 py-3 rounded-lg">
+                                    <span className="font-medium">Warning:</span> {warning}
+                                </div>
+                            ))}
+                        </div>
+                    )}
+
+                    {/* Encoded TLP Display */}
+                    {encodedTLP && validation?.isValid && (
+                        <div className="space-y-6">
+                            {/* Analysis */}
+                            <div className="bg-green-50 border border-green-200 rounded-lg p-6">
+                                <h3 className="text-lg font-semibold text-green-800 mb-3">TLP Analysis</h3>
+                                <div className="space-y-1">
+                                    {encodedTLP.analysis.map((item, idx) => (
+                                        <div key={idx} className="text-green-700">{item}</div>
+                                    ))}
+                                </div>
+                            </div>
+
+                            {/* Bit-level Encoding */}
+                            <div className="bg-white rounded-lg shadow-md p-6">
+                                <h3 className="text-lg font-semibold mb-4">Bit-Level Encoding</h3>
+                                
+                                <div className="space-y-4">
+                                    <BitFieldDisplay 
+                                        label="DW0"
+                                        fields={[
+                                            { name: 'Fmt', value: encodedTLP.fields.fmt.value, bits: 3, desc: 'Format Type' },
+                                            { name: 'Type', value: encodedTLP.fields.type.value, bits: 5, desc: 'TLP Type' },
+                                            { name: 'R', value: '0', bits: 1, desc: 'Reserved' },
+                                            { name: 'TC', value: encodedTLP.fields.tc.value, bits: 3, desc: 'Traffic Class' },
+                                            { name: 'R', value: '0000', bits: 4, desc: 'Reserved' },
+                                            { name: 'Attr', value: '00', bits: 2, desc: 'Attributes' },
+                                            { name: 'R', value: '00', bits: 2, desc: 'Reserved' },
+                                            { 
+                                                name: 'Length', 
+                                                value: encodedTLP.fields.length.value, 
+                                                bits: 10, 
+                                                desc: TLP_TYPES[tlpConfig.type].hasPayload 
+                                                    ? 'Payload Length in DWords' 
+                                                    : 'Length = 0 for read requests (requested size not in header)'
+                                            }
+                                        ]}
+                                    />
+
+                                    <BitFieldDisplay 
+                                        label="DW1"
+                                        fields={[
+                                            { name: 'Requester ID', value: encodedTLP.fields.requesterId, bits: 16, desc: 'Bus:Device:Function', isHex: true },
+                                            { name: 'Tag', value: encodedTLP.fields.tag, bits: 8, desc: 'Transaction Tag', isHex: true },
+                                            { name: 'Last BE', value: encodedTLP.fields.lastBE, bits: 4, desc: 'Last DW Byte Enable', isHex: true },
+                                            { name: 'First BE', value: encodedTLP.fields.firstBE, bits: 4, desc: 'First DW Byte Enable', isHex: true }
+                                        ]}
+                                    />
+
+                                    <BitFieldDisplay 
+                                        label="DW2"
+                                        fields={[
+                                            { name: 'Address', value: encodedTLP.fields.address, bits: 32, desc: tlpConfig.format.includes('3DW') ? 'Address[31:2] + Reserved[1:0]' : 'Upper 32-bit Address', isHex: true }
+                                        ]}
+                                    />
+
+                                    {encodedTLP.dw3 && (
+                                        <BitFieldDisplay 
+                                            label="DW3"
+                                            fields={[
+                                                { name: 'Address', value: encodedTLP.dw3, bits: 32, desc: 'Lower 32-bit Address[31:2] + Reserved[1:0]', isHex: true }
+                                            ]}
+                                        />
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* Hex Display */}
+                            <div className="bg-gray-900 text-green-400 rounded-lg p-6 font-mono">
+                                <h3 className="text-lg font-semibold mb-4 text-white">Raw Hex View</h3>
+                                <div className="space-y-2 text-lg">
+                                    <div>DW0: <span className="text-yellow-300">{encodedTLP.dw0}</span></div>
+                                    <div>DW1: <span className="text-yellow-300">{encodedTLP.dw1}</span></div>
+                                    <div>DW2: <span className="text-yellow-300">{encodedTLP.dw2}</span></div>
+                                    {encodedTLP.dw3 && (
+                                        <div>DW3: <span className="text-yellow-300">{encodedTLP.dw3}</span></div>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // Bit Field Display Component
+        function BitFieldDisplay({ label, fields }) {
+            return (
+                <div className="border border-gray-200 rounded-lg p-4">
+                    <div className="text-sm font-semibold text-gray-600 mb-2">{label}</div>
+                    <div className="flex flex-wrap gap-1">
+                        {fields.map((field, idx) => (
+                            <div 
+                                key={idx}
+                                className="tooltip bit-field border-2 border-blue-400 bg-blue-50 px-3 py-2 rounded cursor-pointer"
+                                style={{ flex: `0 0 ${Math.max(field.bits * 8, 60)}px` }}
+                            >
+                                <div className="text-xs font-semibold text-blue-800">{field.name}</div>
+                                <div className="text-sm font-mono text-blue-600">
+                                    {field.isHex ? field.value : field.value}
+                                </div>
+                                <span className="tooltip-text">
+                                    {field.desc}<br/>
+                                    {field.bits} bits | Value: {field.value}
+                                </span>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            );
+        }
+
+        // Flow Control Simulator Component
+        function FlowControlSimulator({ credits, flowHistory, onSendTLP, hasEncodedTLP }) {
+            const maxCredits = { header: 8, data: 32 };
+
+            return (
+                <div className="space-y-6">
+                    <div>
+                        <h2 className="text-2xl font-bold text-gray-800 mb-2">Flow Control Simulator</h2>
+                        <p className="text-gray-600">Visualize credit-based flow control with integrated TLP and DLLP packet flow.</p>
+                    </div>
+
+                    {/* Credit Status */}
+                    <div className="grid grid-cols-3 gap-4">
+                        {Object.entries(credits).map(([type, credit]) => (
+                            <div key={type} className="bg-white rounded-lg shadow-md p-6">
+                                <h3 className="text-sm font-semibold text-gray-600 uppercase mb-4">
+                                    {type.replace(/([A-Z])/g, ' $1').trim()}
+                                </h3>
+                                
+                                <div className="space-y-3">
+                                    <div>
+                                        <div className="flex justify-between text-sm mb-1">
+                                            <span>Header Credits</span>
+                                            <span className="font-mono">{credit.header}/{maxCredits.header}</span>
+                                        </div>
+                                        <div className="w-full bg-gray-200 rounded-full h-3">
+                                            <div 
+                                                className="credit-bar bg-blue-600 h-3 rounded-full"
+                                                style={{ width: `${(credit.header / maxCredits.header) * 100}%` }}
+                                            />
+                                        </div>
+                                    </div>
+
+                                    <div>
+                                        <div className="flex justify-between text-sm mb-1">
+                                            <span>Data Credits</span>
+                                            <span className="font-mono">{credit.data}/{maxCredits.data}</span>
+                                        </div>
+                                        <div className="w-full bg-gray-200 rounded-full h-3">
+                                            <div 
+                                                className="credit-bar bg-green-600 h-3 rounded-full"
+                                                style={{ width: `${(credit.data / maxCredits.data) * 100}%` }}
+                                            />
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+
+                    {/* Send TLP Button */}
+                    <div className="bg-white rounded-lg shadow-md p-6">
+                        <button 
+                            onClick={onSendTLP}
+                            disabled={!hasEncodedTLP}
+                            className={`w-full py-3 rounded-lg font-semibold transition ${
+                                hasEncodedTLP 
+                                    ? 'bg-blue-600 hover:bg-blue-700 text-white' 
+                                    : 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                            }`}
+                        >
+                            {hasEncodedTLP ? 'Send TLP (Consume Credits)' : 'Generate a TLP first in TLP Builder'}
+                        </button>
+                    </div>
+
+                    {/* Flow History with TLP/DLLP distinction */}
+                    <div className="bg-white rounded-lg shadow-md p-6">
+                        <h3 className="text-lg font-semibold mb-4">Integrated Packet Flow (TLP + DLLP)</h3>
+                        
+                        {flowHistory.length === 0 ? (
+                            <div className="text-gray-500 text-center py-8">
+                                No transactions yet. Generate and send a TLP to see the complete flow with DLLPs.
+                            </div>
+                        ) : (
+                            <div className="space-y-2 max-h-[500px] overflow-y-auto">
+                                {flowHistory.map((entry, idx) => (
+                                    <div key={idx} className={`flex items-center justify-between border-l-4 pl-4 py-3 rounded-r-lg ${
+                                        entry.type === 'TLP' 
+                                            ? 'bg-blue-50 border-blue-500' 
+                                            : 'bg-green-50 border-green-500'
+                                    }`}>
+                                        <div className="flex items-center space-x-4 flex-1">
+                                            <span className="text-xs text-gray-500 font-mono w-20">{entry.timestamp}</span>
+                                            <span className="text-2xl">{entry.direction}</span>
+                                            <div className="flex-1">
+                                                <div className="flex items-center gap-2">
+                                                    <span className={`px-2 py-1 text-xs font-semibold rounded ${
+                                                        entry.type === 'TLP' 
+                                                            ? 'bg-blue-200 text-blue-800' 
+                                                            : 'bg-green-200 text-green-800'
+                                                    }`}>
+                                                        {entry.type}
+                                                    </span>
+                                                    <span className="font-medium">{entry.tlp}</span>
+                                                </div>
+                                                {entry.length > 0 && (
+                                                    <span className="text-sm text-gray-600">Payload: {entry.length} DW ({entry.length * 4} bytes)</span>
+                                                )}
+                                            </div>
+                                        </div>
+                                        <div className="flex items-center gap-4">
+                                            {entry.seqNum !== null && entry.seqNum !== undefined && (
+                                                <div className="text-center">
+                                                    <div className="text-xs text-gray-500">Seq#</div>
+                                                    <div className="font-mono font-bold text-lg">{entry.seqNum}</div>
+                                                </div>
+                                            )}
+                                            <div className="text-sm text-right min-w-[120px]">
+                                                {entry.direction === '→' ? (
+                                                    <div className="text-red-600">
+                                                        Consumed: H:{entry.credits.header} D:{entry.credits.data}
+                                                    </div>
+                                                ) : entry.tlp.includes('UpdateFC') ? (
+                                                    <div className="text-green-600">
+                                                        Returned: H:{entry.credits.header} D:{entry.credits.data}
+                                                    </div>
+                                                ) : entry.tlp === 'Ack' ? (
+                                                    <div className="text-blue-600">
+                                                        ACK Sent
+                                                    </div>
+                                                ) : (
+                                                    <div className="text-gray-600">
+                                                        {entry.type}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Legend */}
+                    <div className="bg-gray-50 rounded-lg p-4">
+                        <h4 className="font-semibold mb-3">Flow Visualization Legend</h4>
+                        <div className="grid grid-cols-2 gap-3 text-sm">
+                            <div className="flex items-center gap-2">
+                                <div className="w-4 h-4 bg-blue-500 border-l-4 border-blue-700 rounded"></div>
+                                <span>TLP (Transaction Layer Packet)</span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                                <div className="w-4 h-4 bg-green-500 border-l-4 border-green-700 rounded"></div>
+                                <span>DLLP (Data Link Layer Packet)</span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                                <span className="text-2xl">→</span>
+                                <span>Outbound (TX)</span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                                <span className="text-2xl">←</span>
+                                <span>Inbound (RX)</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Flow Control Explanation */}
+                    <div className="bg-purple-50 border border-purple-200 rounded-lg p-6">
+                        <h3 className="text-lg font-semibold text-purple-800 mb-3">What You're Seeing</h3>
+                        <ol className="space-y-2 text-sm text-purple-900 list-decimal ml-5">
+                            <li><strong>TLP Sent (→):</strong> Credits consumed based on TLP type and payload size</li>
+                            <li><strong>Ack DLLP (←):</strong> Acknowledges TLP reception with sequence number</li>
+                            <li><strong>UpdateFC DLLP (←):</strong> Returns credits to allow more TLPs to be sent</li>
+                            <li><strong>Completion TLP (←):</strong> Response to non-posted requests (MRd, IORd, etc.)</li>
+                        </ol>
+                        <p className="text-sm mt-3 text-purple-800">
+                            This simulates the real PCIe flow: TLPs carry data, DLLPs manage reliability and flow control.
+                        </p>
+                    </div>
+                </div>
+            );
+        }
+
+        // Guide Section Component
+        function GuideSection() {
+            const [expandedSection, setExpandedSection] = useState('overview');
+
+            const toggleSection = (section) => {
+                setExpandedSection(expandedSection === section ? null : section);
+            };
+
+            return (
+                <div className="space-y-6">
+                    <div>
+                        <h2 className="text-3xl font-bold text-gray-800 mb-2">Interactive PCIe Learning Guide</h2>
+                        <p className="text-gray-600">Master PCIe protocol layer by layer with interactive examples and real-time simulations.</p>
+                    </div>
+
+                    {/* Overview */}
+                    <GuideCard 
+                        title="📘 What is PCIe?"
+                        isExpanded={expandedSection === 'overview'}
+                        onToggle={() => toggleSection('overview')}
+                    >
+                        <div className="space-y-4">
+                            <p className="text-gray-700">
+                                <strong>PCIe (PCI Express)</strong> is a high-speed serial computer expansion bus standard. 
+                                Unlike parallel buses, PCIe uses point-to-point serial links called "lanes" to transfer data.
+                            </p>
+                            <div className="bg-blue-50 p-4 rounded-lg">
+                                <h4 className="font-semibold mb-2">PCIe Architecture (3 Layers):</h4>
+                                <ul className="space-y-2 text-sm">
+                                    <li>🔵 <strong>Transaction Layer:</strong> Handles TLPs (Transaction Layer Packets) - the actual data transfers</li>
+                                    <li>🟢 <strong>Data Link Layer:</strong> Ensures reliable delivery using DLLPs, sequence numbers, and flow control</li>
+                                    <li>🟡 <strong>Physical Layer:</strong> Manages the actual electrical signaling and link training</li>
+                                </ul>
+                            </div>
+                            <p className="text-sm text-gray-600">
+                                This application lets you build TLPs, track DLLPs, simulate flow control, and configure PCIe capabilities - 
+                                giving you hands-on experience with how PCIe actually works under the hood.
+                            </p>
+                        </div>
+                    </GuideCard>
+
+                    {/* TLP Guide */}
+                    <GuideCard 
+                        title="🔧 Transaction Layer Packets (TLPs)"
+                        isExpanded={expandedSection === 'tlp'}
+                        onToggle={() => toggleSection('tlp')}
+                    >
+                        <div className="space-y-4">
+                            <p className="text-gray-700">
+                                TLPs are the fundamental units of data transfer in PCIe. They carry memory reads/writes, 
+                                I/O operations, configuration accesses, and completions.
+                            </p>
+                            
+                            <div className="bg-gray-50 p-4 rounded-lg">
+                                <h4 className="font-semibold mb-3">TLP Header Structure:</h4>
+                                <div className="space-y-2 text-sm font-mono">
+                                    <div className="grid grid-cols-4 gap-2">
+                                        <div className="bg-blue-100 p-2 rounded">Fmt[2:0]</div>
+                                        <div className="bg-green-100 p-2 rounded">Type[4:0]</div>
+                                        <div className="bg-yellow-100 p-2 rounded">TC[2:0]</div>
+                                        <div className="bg-purple-100 p-2 rounded">Length[9:0]</div>
+                                    </div>
+                                </div>
+                                <p className="text-sm mt-3 text-gray-600">
+                                    <strong>Fmt:</strong> Format (3DW/4DW, with/without data)<br/>
+                                    <strong>Type:</strong> Transaction type (MRd, MWr, CfgRd, etc.)<br/>
+                                    <strong>TC:</strong> Traffic Class for QoS<br/>
+                                    <strong>Length:</strong> Payload size in DWords
+                                </p>
+                                <div className="bg-yellow-100 border border-yellow-300 p-3 rounded mt-3">
+                                    <p className="text-xs font-normal text-yellow-900">
+                                        <strong>⚠️ Important:</strong> For <strong>read requests</strong> (MRd, IORd, CfgRd), 
+                                        the Length field in the header is <strong>always 0</strong> because there's no payload. 
+                                        The requested data size is determined by the First/Last BE fields. The completion 
+                                        will contain the actual data with its own length field.
+                                    </p>
+                                </div>
+                            </div>
+
+                            <div className="bg-green-50 p-4 rounded-lg">
+                                <h4 className="font-semibold mb-2">Key TLP Types:</h4>
+                                <ul className="space-y-1 text-sm">
+                                    <li><strong>Memory Read (MRd):</strong> Non-posted, requires Completion</li>
+                                    <li><strong>Memory Write (MWr):</strong> Posted, fire-and-forget</li>
+                                    <li><strong>Configuration Read/Write:</strong> Access device config space</li>
+                                    <li><strong>Completion (Cpl/CplD):</strong> Response to non-posted requests</li>
+                                </ul>
+                            </div>
+
+                            <div className="bg-yellow-50 p-4 rounded-lg border border-yellow-200">
+                                <p className="text-sm"><strong>💡 Try it:</strong> Use the <strong>TLP Builder</strong> section to create different TLP types and see how the header bits change!</p>
+                            </div>
+                        </div>
+                    </GuideCard>
+
+                    {/* DLLP Guide */}
+                    <GuideCard 
+                        title="📡 Data Link Layer Packets (DLLPs)"
+                        isExpanded={expandedSection === 'dllp'}
+                        onToggle={() => toggleSection('dllp')}
+                    >
+                        <div className="space-y-4">
+                            <p className="text-gray-700">
+                                DLLPs are control packets that ensure reliable TLP delivery. They don't carry payload data - 
+                                they manage acknowledgments, flow control, and power management.
+                            </p>
+
+                            <div className="bg-blue-50 p-4 rounded-lg">
+                                <h4 className="font-semibold mb-3">DLLP Categories:</h4>
+                                <div className="space-y-3">
+                                    <div>
+                                        <strong className="text-blue-700">Flow Control DLLPs:</strong>
+                                        <ul className="ml-4 mt-1 text-sm space-y-1">
+                                            <li>• <strong>InitFC:</strong> Initialize flow control credits at link startup</li>
+                                            <li>• <strong>UpdateFC:</strong> Return consumed credits back to sender</li>
+                                            <li>• Separate for Posted (P), Non-Posted (NP), and Completion (Cpl)</li>
+                                        </ul>
+                                    </div>
+                                    <div>
+                                        <strong className="text-green-700">Acknowledgment DLLPs:</strong>
+                                        <ul className="ml-4 mt-1 text-sm space-y-1">
+                                            <li>• <strong>Ack:</strong> Confirms successful TLP reception (includes sequence number)</li>
+                                            <li>• <strong>Nak:</strong> Requests TLP retransmission due to error</li>
+                                        </ul>
+                                    </div>
+                                    <div>
+                                        <strong className="text-purple-700">Power Management DLLPs:</strong>
+                                        <ul className="ml-4 mt-1 text-sm space-y-1">
+                                            <li>• <strong>PM_Enter_L1:</strong> Enter low power state L1</li>
+                                            <li>• <strong>PM_Enter_L23:</strong> Enter very low power state L23</li>
+                                        </ul>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div className="bg-yellow-50 p-4 rounded-lg border border-yellow-200">
+                                <p className="text-sm"><strong>💡 Explore:</strong> Check the <strong>DLLP Explorer</strong> to see all DLLP types and their purposes!</p>
+                            </div>
+                        </div>
+                    </GuideCard>
+
+                    {/* Sequence Numbers */}
+                    <GuideCard 
+                        title="🔢 Sequence Numbers & Replay Mechanism"
+                        isExpanded={expandedSection === 'sequence'}
+                        onToggle={() => toggleSection('sequence')}
+                    >
+                        <div className="space-y-4">
+                            <p className="text-gray-700">
+                                PCIe uses 12-bit sequence numbers (0-4095) to track TLPs and ensure reliable delivery. 
+                                Each TLP gets a sequence number, and the receiver sends Ack DLLPs to confirm receipt.
+                            </p>
+
+                            <div className="bg-green-50 p-4 rounded-lg">
+                                <h4 className="font-semibold mb-3">How It Works:</h4>
+                                <ol className="space-y-2 text-sm list-decimal ml-5">
+                                    <li>Sender assigns incrementing sequence number to each TLP</li>
+                                    <li>TLP is stored in <strong>Replay Buffer</strong> until acknowledged</li>
+                                    <li>Receiver validates TLP (LCRC check) and sends <strong>Ack DLLP</strong></li>
+                                    <li>Sender removes acknowledged TLP from replay buffer</li>
+                                    <li>If error detected, receiver sends <strong>Nak DLLP</strong></li>
+                                    <li>Sender retransmits all TLPs from Nak sequence number onwards</li>
+                                </ol>
+                            </div>
+
+                            <div className="bg-blue-50 p-4 rounded-lg">
+                                <h4 className="font-semibold mb-2">Replay Buffer:</h4>
+                                <p className="text-sm text-gray-700">
+                                    A circular buffer (typically 8-16 TLPs deep) that holds transmitted TLPs until they're acknowledged.
+                                    This enables automatic retransmission without involving software.
+                                </p>
+                            </div>
+
+                            <div className="bg-yellow-50 p-4 rounded-lg border border-yellow-200">
+                                <p className="text-sm"><strong>💡 Watch it work:</strong> Use <strong>Sequence Tracker</strong> to monitor sequence numbers as you send TLPs!</p>
+                            </div>
+                        </div>
+                    </GuideCard>
+
+                    {/* Flow Control */}
+                    <GuideCard 
+                        title="🎮 Credit-Based Flow Control"
+                        isExpanded={expandedSection === 'flow'}
+                        onToggle={() => toggleSection('flow')}
+                    >
+                        <div className="space-y-4">
+                            <p className="text-gray-700">
+                                PCIe uses credit-based flow control to prevent buffer overflow. Before sending TLPs, 
+                                a device must have sufficient credits from the receiver.
+                            </p>
+
+                            <div className="bg-purple-50 p-4 rounded-lg">
+                                <h4 className="font-semibold mb-3">Three Credit Types:</h4>
+                                <div className="space-y-2 text-sm">
+                                    <div className="flex items-start">
+                                        <span className="font-mono bg-blue-200 px-2 py-1 rounded mr-2">Posted (P)</span>
+                                        <span>Memory Writes - fire and forget, no completion needed</span>
+                                    </div>
+                                    <div className="flex items-start">
+                                        <span className="font-mono bg-green-200 px-2 py-1 rounded mr-2">Non-Posted (NP)</span>
+                                        <span>Memory Reads, I/O, Config - require completions</span>
+                                    </div>
+                                    <div className="flex items-start">
+                                        <span className="font-mono bg-yellow-200 px-2 py-1 rounded mr-2">Completion (Cpl)</span>
+                                        <span>Responses to non-posted requests</span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div className="bg-gray-50 p-4 rounded-lg">
+                                <h4 className="font-semibold mb-3">Credit Types:</h4>
+                                <ul className="space-y-1 text-sm">
+                                    <li>• <strong>Header Credits:</strong> Permission to send TLP headers (usually 1 credit = 1 TLP)</li>
+                                    <li>• <strong>Data Credits:</strong> Permission to send payload data (in DWords)</li>
+                                </ul>
+                                <p className="text-sm mt-3 text-gray-600">
+                                    Example: To send 8 DW Memory Write, you need 1 header credit + 8 data credits for Posted type.
+                                </p>
+                            </div>
+
+                            <div className="bg-yellow-50 p-4 rounded-lg border border-yellow-200">
+                                <p className="text-sm"><strong>💡 Simulate:</strong> Go to <strong>Flow Control Simulator</strong> to send TLPs and watch credits being consumed and returned!</p>
+                            </div>
+                        </div>
+                    </GuideCard>
+
+                    {/* PCIe Capabilities */}
+                    <GuideCard 
+                        title="⚙️ PCIe Configuration & Capabilities"
+                        isExpanded={expandedSection === 'config'}
+                        onToggle={() => toggleSection('config')}
+                    >
+                        <div className="space-y-4">
+                            <p className="text-gray-700">
+                                Every PCIe device has a Configuration Space containing capabilities that describe 
+                                what the device supports and how it should operate.
+                            </p>
+
+                            <div className="bg-blue-50 p-4 rounded-lg">
+                                <h4 className="font-semibold mb-3">Key Capabilities:</h4>
+                                <div className="space-y-3 text-sm">
+                                    <div>
+                                        <strong>Max Payload Size (MPS):</strong>
+                                        <p className="text-gray-600 ml-4">Maximum data payload in a single TLP (128B - 4096B)</p>
+                                    </div>
+                                    <div>
+                                        <strong>Max Read Request Size (MRRS):</strong>
+                                        <p className="text-gray-600 ml-4">Maximum memory read request size (128B - 4096B)</p>
+                                    </div>
+                                    <div>
+                                        <strong>Link Speed & Width:</strong>
+                                        <p className="text-gray-600 ml-4">Gen1: 2.5GT/s, Gen2: 5.0GT/s, Gen3: 8.0GT/s, Gen4: 16.0GT/s, Gen5: 32.0GT/s</p>
+                                        <p className="text-gray-600 ml-4">Width: x1, x2, x4, x8, x16, x32</p>
+                                    </div>
+                                    <div>
+                                        <strong>Power Management (ASPM):</strong>
+                                        <p className="text-gray-600 ml-4">L0s: Microsecond-level low power, L1: Higher latency deeper sleep</p>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div className="bg-green-50 p-4 rounded-lg">
+                                <h4 className="font-semibold mb-2">Configuration Space Access:</h4>
+                                <p className="text-sm text-gray-700">
+                                    • <strong>Type 0:</strong> Access device on local bus<br/>
+                                    • <strong>Type 1:</strong> Access device behind a bridge
+                                </p>
+                            </div>
+
+                            <div className="bg-yellow-50 p-4 rounded-lg border border-yellow-200">
+                                <p className="text-sm"><strong>💡 Configure:</strong> Visit <strong>PCIe Capabilities</strong> section to adjust device settings and see their impact!</p>
+                            </div>
+                        </div>
+                    </GuideCard>
+
+                    {/* Quick Start */}
+                    <div className="bg-gradient-to-r from-blue-500 to-purple-600 text-white rounded-lg p-6">
+                        <h3 className="text-xl font-bold mb-3">🚀 Quick Start Guide</h3>
+                        <ol className="space-y-2 text-sm">
+                            <li><strong>1. Build a TLP:</strong> Go to "TLP Builder" and create your first Memory Read request</li>
+                            <li><strong>2. Explore DLLPs:</strong> Check "DLLP Explorer" to understand control packets</li>
+                            <li><strong>3. Simulate Flow:</strong> Use "Flow Control Simulator" to send TLPs and watch credits</li>
+                            <li><strong>4. Track Sequences:</strong> Monitor sequence numbers in "Sequence Tracker"</li>
+                            <li><strong>5. Configure Device:</strong> Adjust PCIe settings in "PCIe Capabilities"</li>
+                        </ol>
+                    </div>
+                </div>
+            );
+        }
+
+        // Guide Card Component
+        function GuideCard({ title, children, isExpanded, onToggle }) {
+            return (
+                <div className="bg-white rounded-lg shadow-md overflow-hidden">
+                    <button 
+                        onClick={onToggle}
+                        className="w-full px-6 py-4 flex justify-between items-center hover:bg-gray-50 transition"
+                    >
+                        <h3 className="text-lg font-semibold text-gray-800">{title}</h3>
+                        <span className="text-2xl text-gray-400">{isExpanded ? '−' : '+'}</span>
+                    </button>
+                    {isExpanded && (
+                        <div className="px-6 py-4 border-t border-gray-200">
+                            {children}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // DLLP Explorer Component
+        function DLLPExplorer() {
+            const [selectedCategory, setSelectedCategory] = useState('all');
+            
+            const categories = ['all', 'Flow Control', 'Power Management'];
+            
+            const filteredDLLPs = Object.entries(DLLP_TYPES).filter(([key, dllp]) => {
+                if (selectedCategory === 'all') return true;
+                return dllp.category === selectedCategory;
+            });
+
+            return (
+                <div className="space-y-6">
+                    <div>
+                        <h2 className="text-2xl font-bold text-gray-800 mb-2">DLLP Explorer</h2>
+                        <p className="text-gray-600">Explore all Data Link Layer Packet types and their purposes in PCIe protocol.</p>
+                    </div>
+
+                    {/* Category Filter */}
+                    <div className="bg-white rounded-lg shadow-md p-4">
+                        <div className="flex gap-2">
+                            {categories.map(cat => (
+                                <button
+                                    key={cat}
+                                    onClick={() => setSelectedCategory(cat)}
+                                    className={`px-4 py-2 rounded-lg font-medium transition ${
+                                        selectedCategory === cat 
+                                            ? 'bg-blue-600 text-white' 
+                                            : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                                    }`}
+                                >
+                                    {cat === 'all' ? 'All DLLPs' : cat}
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+
+                    {/* DLLP Cards */}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        {filteredDLLPs.map(([key, dllp]) => (
+                            <div key={key} className="bg-white rounded-lg shadow-md p-6 hover:shadow-lg transition">
+                                <div className="flex items-start justify-between mb-3">
+                                    <div>
+                                        <h3 className="text-lg font-bold text-gray-800">{dllp.name}</h3>
+                                        <span className={`inline-block px-2 py-1 text-xs rounded-full mt-1 ${
+                                            dllp.category === 'Flow Control' ? 'bg-blue-100 text-blue-700' : 'bg-purple-100 text-purple-700'
+                                        }`}>
+                                            {dllp.category}
+                                        </span>
+                                    </div>
+                                    <div className="font-mono text-sm bg-gray-100 px-3 py-1 rounded">
+                                        {dllp.code}
+                                    </div>
+                                </div>
+                                
+                                <p className="text-gray-600 text-sm mb-3">{dllp.description}</p>
+                                
+                                <div className="flex items-center gap-4 text-sm">
+                                    <div className={`flex items-center ${dllp.hasSeqNum ? 'text-green-600' : 'text-gray-400'}`}>
+                                        {dllp.hasSeqNum ? '✓' : '✗'} Sequence Number
+                                    </div>
+                                    {dllp.creditType && (
+                                        <div className="text-blue-600">
+                                            Credit: {dllp.creditType}
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+
+                    {/* Info Section */}
+                    <div className="bg-blue-50 border border-blue-200 rounded-lg p-6">
+                        <h3 className="text-lg font-semibold text-blue-800 mb-3">DLLP Structure</h3>
+                        <div className="space-y-2 text-sm text-blue-900">
+                            <p>• <strong>Size:</strong> Fixed 8 bytes (much smaller than TLPs)</p>
+                            <p>• <strong>CRC:</strong> 16-bit CRC for error detection</p>
+                            <p>• <strong>No Payload:</strong> DLLPs carry only control information</p>
+                            <p>• <strong>Priority:</strong> DLLPs have higher priority than TLPs on the link</p>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        // Sequence Tracker Component
+        function SequenceTracker({ seqStats, flowHistory }) {
+            return (
+                <div className="space-y-6">
+                    <div>
+                        <h2 className="text-2xl font-bold text-gray-800 mb-2">Sequence Number Tracker</h2>
+                        <p className="text-gray-600">Monitor TLP sequence numbers and replay buffer status in real-time.</p>
+                    </div>
+
+                    {/* Sequence Stats */}
+                    <div className="grid grid-cols-4 gap-4">
+                        <div className="bg-white rounded-lg shadow-md p-6">
+                            <div className="text-sm text-gray-600 mb-1">TX Sequence</div>
+                            <div className="text-3xl font-bold text-blue-600">{seqStats.txSeqNum}</div>
+                            <div className="text-xs text-gray-500 mt-1">Next to transmit</div>
+                        </div>
+                        <div className="bg-white rounded-lg shadow-md p-6">
+                            <div className="text-sm text-gray-600 mb-1">RX Sequence</div>
+                            <div className="text-3xl font-bold text-green-600">{seqStats.rxSeqNum}</div>
+                            <div className="text-xs text-gray-500 mt-1">Next expected</div>
+                        </div>
+                        <div className="bg-white rounded-lg shadow-md p-6">
+                            <div className="text-sm text-gray-600 mb-1">Last Ack</div>
+                            <div className="text-3xl font-bold text-purple-600">{seqStats.ackSeqNum}</div>
+                            <div className="text-xs text-gray-500 mt-1">Acknowledged up to</div>
+                        </div>
+                        <div className="bg-white rounded-lg shadow-md p-6">
+                            <div className="text-sm text-gray-600 mb-1">Replay Buffer</div>
+                            <div className="text-3xl font-bold text-orange-600">{seqStats.replayBufferSize}</div>
+                            <div className="text-xs text-gray-500 mt-1">TLPs awaiting Ack</div>
+                        </div>
+                    </div>
+
+                    {/* Sequence Timeline */}
+                    <div className="bg-white rounded-lg shadow-md p-6">
+                        <h3 className="text-lg font-semibold mb-4">Sequence Number Timeline</h3>
+                        
+                        {flowHistory.length === 0 ? (
+                            <div className="text-gray-500 text-center py-8">
+                                No sequence activity yet. Send TLPs from the Flow Control Simulator to see sequence tracking.
+                            </div>
+                        ) : (
+                            <div className="space-y-3 max-h-96 overflow-y-auto">
+                                {flowHistory.filter(entry => entry.seqNum !== null && entry.seqNum !== undefined).map((entry, idx) => (
+                                    <div key={idx} className={`flex items-center justify-between p-3 rounded-lg ${
+                                        entry.type === 'TLP' ? 'bg-blue-50 border border-blue-200' : 'bg-green-50 border border-green-200'
+                                    }`}>
+                                        <div className="flex items-center gap-4">
+                                            <span className="text-xs text-gray-500 font-mono w-20">{entry.timestamp}</span>
+                                            <span className="text-xl">{entry.direction}</span>
+                                            <div>
+                                                <div className="font-medium">{entry.tlp}</div>
+                                                <div className="text-xs text-gray-600">{entry.type}</div>
+                                            </div>
+                                        </div>
+                                        <div className="flex items-center gap-3">
+                                            <div className="text-right">
+                                                <div className="text-sm font-semibold">Seq: {entry.seqNum}</div>
+                                                <div className="text-xs text-gray-500">
+                                                    {entry.type === 'DLLP' && entry.tlp === 'Ack' ? 'Acknowledged' : 
+                                                     entry.type === 'TLP' ? 'Sent' : ''}
+                                                </div>
+                                            </div>
+                                            <div className={`w-10 h-10 rounded-full flex items-center justify-center font-bold text-white ${
+                                                entry.type === 'TLP' ? 'bg-blue-500' : 'bg-green-500'
+                                            }`}>
+                                                {entry.seqNum}
+                                            </div>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Info Section */}
+                    <div className="bg-purple-50 border border-purple-200 rounded-lg p-6">
+                        <h3 className="text-lg font-semibold text-purple-800 mb-3">How Sequence Numbers Work</h3>
+                        <ol className="space-y-2 text-sm text-purple-900 list-decimal ml-5">
+                            <li>Each TLP is assigned an incrementing 12-bit sequence number (0-4095, then wraps)</li>
+                            <li>Transmitted TLPs are held in the replay buffer until acknowledged</li>
+                            <li>Receiver validates TLP using LCRC and sends Ack DLLP with sequence number</li>
+                            <li>Upon receiving Ack, sender removes TLP from replay buffer</li>
+                            <li>If Nak received, all TLPs from that sequence onwards are retransmitted</li>
+                            <li>Replay buffer typically holds 8-16 TLPs depending on implementation</li>
+                        </ol>
+                    </div>
+                </div>
+            );
+        }
+
+        // PCIe Capabilities Component
+        function PCIeCapabilities({ config, onConfigChange }) {
+            const updateConfig = (key, value) => {
+                onConfigChange({ ...config, [key]: value });
+            };
+
+            return (
+                <div className="space-y-6">
+                    <div>
+                        <h2 className="text-2xl font-bold text-gray-800 mb-2">PCIe Device Capabilities</h2>
+                        <p className="text-gray-600">Configure PCIe device parameters and understand their impact on performance.</p>
+                    </div>
+
+                    {/* Device Control */}
+                    <div className="bg-white rounded-lg shadow-md p-6">
+                        <h3 className="text-lg font-semibold mb-4">Device Control Register</h3>
+                        
+                        <div className="space-y-4">
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-2">
+                                    Max Payload Size (MPS)
+                                </label>
+                                <select 
+                                    className="w-full border border-gray-300 rounded-md px-3 py-2"
+                                    value={config.maxPayloadSize}
+                                    onChange={(e) => updateConfig('maxPayloadSize', parseInt(e.target.value))}
+                                >
+                                    {PCIE_CAPABILITIES.deviceCapabilities.maxPayloadSize.map(size => (
+                                        <option key={size} value={size}>{size} bytes</option>
+                                    ))}
+                                </select>
+                                <p className="text-xs text-gray-500 mt-1">
+                                    Maximum TLP payload size. Larger = fewer TLPs, but requires more buffer space.
+                                </p>
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-2">
+                                    Max Read Request Size (MRRS)
+                                </label>
+                                <select 
+                                    className="w-full border border-gray-300 rounded-md px-3 py-2"
+                                    value={config.maxReadRequestSize}
+                                    onChange={(e) => updateConfig('maxReadRequestSize', parseInt(e.target.value))}
+                                >
+                                    {PCIE_CAPABILITIES.deviceCapabilities.maxPayloadSize.map(size => (
+                                        <option key={size} value={size}>{size} bytes</option>
+                                    ))}
+                                </select>
+                                <p className="text-xs text-gray-500 mt-1">
+                                    Maximum memory read request. Affects completion size and latency.
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Link Capabilities */}
+                    <div className="bg-white rounded-lg shadow-md p-6">
+                        <h3 className="text-lg font-semibold mb-4">Link Capabilities</h3>
+                        
+                        <div className="space-y-4">
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-2">
+                                    Link Speed
+                                </label>
+                                <select 
+                                    className="w-full border border-gray-300 rounded-md px-3 py-2"
+                                    value={config.linkSpeed}
+                                    onChange={(e) => updateConfig('linkSpeed', e.target.value)}
+                                >
+                                    {PCIE_CAPABILITIES.linkCapabilities.maxLinkSpeed.map(speed => (
+                                        <option key={speed} value={speed}>{speed}</option>
+                                    ))}
+                                </select>
+                                <p className="text-xs text-gray-500 mt-1">
+                                    Gen1: 2.5GT/s, Gen2: 5.0GT/s, Gen3: 8.0GT/s, Gen4: 16.0GT/s, Gen5: 32.0GT/s
+                                </p>
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-2">
+                                    Link Width
+                                </label>
+                                <select 
+                                    className="w-full border border-gray-300 rounded-md px-3 py-2"
+                                    value={config.linkWidth}
+                                    onChange={(e) => updateConfig('linkWidth', e.target.value)}
+                                >
+                                    {PCIE_CAPABILITIES.linkCapabilities.maxLinkWidth.map(width => (
+                                        <option key={width} value={width}>{width}</option>
+                                    ))}
+                                </select>
+                                <p className="text-xs text-gray-500 mt-1">
+                                    Number of lanes. x16 provides maximum bandwidth.
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Bandwidth Calculator */}
+                    <div className="bg-gradient-to-r from-blue-500 to-purple-600 text-white rounded-lg p-6">
+                        <h3 className="text-lg font-semibold mb-3">Calculated Bandwidth</h3>
+                        <BandwidthCalculator config={config} />
+                    </div>
+
+                    {/* Info Cards */}
+                    <div className="grid grid-cols-2 gap-4">
+                        <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+                            <h4 className="font-semibold text-blue-800 mb-2">MPS vs MRRS</h4>
+                            <p className="text-sm text-blue-900">
+                                <strong>MPS</strong> affects write efficiency. <strong>MRRS</strong> affects read latency.
+                                Larger values = better throughput but more buffer needed.
+                            </p>
+                        </div>
+                        <div className="bg-green-50 border border-green-200 rounded-lg p-4">
+                            <h4 className="font-semibold text-green-800 mb-2">Link Speed & Width</h4>
+                            <p className="text-sm text-green-900">
+                                Bandwidth = Speed × Width × Encoding Efficiency.
+                                Gen3+ uses 128b/130b (98.5%), Gen1/2 use 8b/10b (80%).
+                            </p>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        // Bandwidth Calculator Helper
+        function BandwidthCalculator({ config }) {
+            const calculateBandwidth = () => {
+                const speedMap = {
+                    '2.5GT/s': 2.5,
+                    '5.0GT/s': 5.0,
+                    '8.0GT/s': 8.0,
+                    '16.0GT/s': 16.0,
+                    '32.0GT/s': 32.0
+                };
+                
+                const widthMap = {
+                    'x1': 1, 'x2': 2, 'x4': 4, 'x8': 8, 'x12': 12, 'x16': 16, 'x32': 32
+                };
+
+                const speed = speedMap[config.linkSpeed];
+                const width = widthMap[config.linkWidth];
+                const encoding = speed >= 8.0 ? 128/130 : 8/10; // Gen3+ uses 128b/130b, Gen1/2 use 8b/10b
+                
+                const bandwidthGbps = speed * width * encoding;
+                const bandwidthMBps = (bandwidthGbps * 1000) / 8;
+
+                return {
+                    gbps: bandwidthGbps.toFixed(2),
+                    mbps: bandwidthMBps.toFixed(0)
+                };
+            };
+
+            const bw = calculateBandwidth();
+
+            return (
+                <div className="space-y-2">
+                    <div className="flex justify-between items-center">
+                        <span>Raw Bandwidth:</span>
+                        <span className="text-2xl font-bold">{bw.gbps} Gb/s</span>
+                    </div>
+                    <div className="flex justify-between items-center">
+                        <span>Effective Throughput:</span>
+                        <span className="text-2xl font-bold">{bw.mbps} MB/s</span>
+                    </div>
+                    <div className="text-xs opacity-90 mt-2">
+                        Based on {config.linkSpeed} × {config.linkWidth} with encoding overhead
+                    </div>
+                </div>
+            );
+        }
+
+        // Render App
+        ReactDOM.render(<PCIeApp />, document.getElementById('root'));
+    </script>
+</body>
+</html>
